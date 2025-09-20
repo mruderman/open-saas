@@ -1,0 +1,139 @@
+name: Sync Fork with Upstream
+
+on:
+  schedule:
+    # Run daily at 2 AM UTC
+    - cron: "0 2 * * *"
+  workflow_dispatch:
+    # Allow manual triggering
+
+env:
+  UPSTREAM_REPO: wasp-lang/open-saas
+  UPSTREAM_BRANCH: main
+  FORK_BRANCH: main
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Add upstream remote
+        run: |
+          git remote add upstream https://github.com/${{ env.UPSTREAM_REPO }}.git
+          git fetch upstream
+
+      - name: Check for upstream changes
+        id: check_changes
+        run: |
+          # Get the latest commit from upstream
+          UPSTREAM_COMMIT=$(git rev-parse upstream/${{ env.UPSTREAM_BRANCH }})
+          FORK_COMMIT=$(git rev-parse origin/${{ env.FORK_BRANCH }})
+
+          echo "Upstream commit: $UPSTREAM_COMMIT"
+          echo "Fork commit: $FORK_COMMIT"
+
+          if [ "$UPSTREAM_COMMIT" != "$FORK_COMMIT" ]; then
+            echo "Changes detected in upstream repository"
+            echo "has_changes=true" >> $GITHUB_OUTPUT
+            echo "upstream_commit=$UPSTREAM_COMMIT" >> $GITHUB_OUTPUT
+            
+            # Count new commits
+            NEW_COMMITS=$(git rev-list --count $FORK_COMMIT..$UPSTREAM_COMMIT)
+            echo "new_commits=$NEW_COMMITS" >> $GITHUB_OUTPUT
+          else
+            echo "No changes detected in upstream repository"
+            echo "has_changes=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Create sync branch
+        if: steps.check_changes.outputs.has_changes == 'true'
+        run: |
+          BRANCH_NAME="sync-upstream-$(date +%Y%m%d-%H%M%S)"
+          echo "SYNC_BRANCH=$BRANCH_NAME" >> $GITHUB_ENV
+          git checkout -b $BRANCH_NAME
+
+      - name: Merge upstream changes
+        if: steps.check_changes.outputs.has_changes == 'true'
+        id: merge_changes
+        run: |
+          # Try to merge upstream changes
+          if git merge upstream/${{ env.UPSTREAM_BRANCH }} --no-edit; then
+            echo "Merge successful"
+            echo "merge_status=success" >> $GITHUB_OUTPUT
+          else
+            echo "Merge conflicts detected"
+            echo "merge_status=conflict" >> $GITHUB_OUTPUT
+            # Abort the merge to clean up
+            git merge --abort
+            # Create a merge commit that shows the conflict
+            git merge upstream/${{ env.UPSTREAM_BRANCH }} --no-commit --no-ff || true
+          fi
+
+      - name: Push sync branch
+        if: steps.check_changes.outputs.has_changes == 'true'
+        run: |
+          git push origin $SYNC_BRANCH
+
+      - name: Create Pull Request
+        if: steps.check_changes.outputs.has_changes == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { data: pullRequest } = await github.rest.pulls.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `🔄 Sync with upstream (${{ steps.check_changes.outputs.new_commits }} new commits)`,
+              head: process.env.SYNC_BRANCH,
+              base: '${{ env.FORK_BRANCH }}',
+              body: `## 🔄 Upstream Sync
+              
+              This PR automatically syncs the fork with the upstream repository [\`${{ env.UPSTREAM_REPO }}\`](https://github.com/${{ env.UPSTREAM_REPO }}).
+              
+              ### 📊 Summary
+              - **New commits from upstream**: ${{ steps.check_changes.outputs.new_commits }}
+              - **Upstream commit**: \`${{ steps.check_changes.outputs.upstream_commit }}\`
+              - **Merge status**: \`${{ steps.merge_changes.outputs.merge_status }}\`
+              
+              ${{ steps.merge_changes.outputs.merge_status == 'conflict' && '⚠️ **Merge conflicts detected!** Please review and resolve conflicts before merging.' || '✅ **Clean merge!** No conflicts detected.' }}
+              
+              ### 🔍 What to do next
+              
+              ${{ steps.merge_changes.outputs.merge_status == 'conflict' && 
+              '1. Review the conflicts in the changed files\n2. Resolve conflicts locally or in the GitHub web editor\n3. Test the changes\n4. Merge this PR' || 
+              '1. Review the changes from upstream\n2. Test if needed\n3. Merge this PR to sync with upstream' }}
+              
+              ---
+              
+              🤖 This PR was created automatically by the [Sync Fork workflow](https://github.com/${{ github.repository }}/actions/workflows/sync-upstream.yml).
+              `
+            });
+
+            console.log(\`Created PR #\${pullRequest.number}: \${pullRequest.title}\`);
+
+      - name: Summary
+        if: always()
+        run: |
+          if [ "${{ steps.check_changes.outputs.has_changes }}" == "true" ]; then
+            echo "✅ Sync workflow completed. Created PR with ${{ steps.check_changes.outputs.new_commits }} new commits from upstream."
+            if [ "${{ steps.merge_changes.outputs.merge_status }}" == "conflict" ]; then
+              echo "⚠️  Merge conflicts detected. Manual review required."
+            else
+              echo "🎉 Clean merge! No conflicts detected."
+            fi
+          else
+            echo "ℹ️  No changes detected in upstream repository. Fork is up to date."
+          fi
